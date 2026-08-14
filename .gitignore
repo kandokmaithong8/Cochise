@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+
+# Real secrets — never commit this. Only secrets.toml.example belongs in git.
+.streamlit/secrets.toml
