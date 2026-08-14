@@ -1,5 +1,6 @@
 import os
 import math
+from io import BytesIO
 from datetime import date, timedelta
 
 import requests
@@ -7,7 +8,9 @@ import pandas as pd
 import streamlit as st
 import folium
 import airportsdata
+import pycountry
 import streamlit.components.v1 as components
+from streamlit_searchbox import st_searchbox
 
 
 # ============================================================
@@ -22,7 +25,25 @@ st.set_page_config(
 
 
 # ============================================================
-# SECRET LOADER
+# HTML RENDER HELPER
+# Streamlit's Markdown renderer treats any line that starts
+# with 4+ leading spaces as a code block, per CommonMark rules.
+# Since HTML snippets are built inside indented Python blocks
+# (loops, functions), the f-strings inherit that indentation and
+# get rendered as literal text instead of HTML. This helper strips
+# leading/trailing whitespace from every line before handing it to
+# st.markdown, so Python source indentation never leaks into the
+# rendered output.
+# ============================================================
+
+def render_html(html: str):
+    cleaned_lines = [line.strip() for line in html.split("\n")]
+    cleaned = "\n".join(cleaned_lines).strip()
+    st.markdown(cleaned, unsafe_allow_html=True)
+
+
+# ============================================================
+# AUTO LOAD SERPAPI KEY FROM STREAMLIT SECRETS
 # ============================================================
 
 def get_serpapi_key():
@@ -37,10 +58,8 @@ def get_serpapi_key():
         key = os.environ.get("SERPAPI_KEY")
 
     if not key:
-        st.error(
-            "SERPAPI_KEY was not found. Please add this in Streamlit Community Cloud > App settings > Secrets:\n\n"
-            'SERPAPI_KEY = "your_serpapi_key_here"'
-        )
+        st.error("SERPAPI_KEY was not found in Streamlit Secrets.")
+        st.code('SERPAPI_KEY = "your_serpapi_key_here"', language="toml")
 
         with st.expander("Debug secret status"):
             try:
@@ -68,11 +87,23 @@ OVERPASS_URLS = [
     "https://overpass.kumi.systems/api/interpreter",
 ]
 
-POI_COLUMNS = ["name", "category", "lat", "lon", "cuisine", "tourism_type"]
+POI_COLUMNS = [
+    "name",
+    "local_name",
+    "category",
+    "lat",
+    "lon",
+    "cuisine",
+    "tourism_type",
+    "notable",
+    "dist_from_center_km",
+]
+
+APP_SHARE_URL = "https://cochise-kgrf2xcmc842zpgng9j9ct.streamlit.app/"
 
 
 # ============================================================
-# AIRPORT DATA
+# AIRPORTS
 # ============================================================
 
 @st.cache_data(show_spinner=False)
@@ -84,10 +115,7 @@ def load_airports():
         lat = info.get("lat")
         lon = info.get("lon")
 
-        if not code:
-            continue
-
-        if lat in (None, 0) or lon in (None, 0):
+        if not code or lat in (None, 0) or lon in (None, 0):
             continue
 
         cleaned[code] = {
@@ -102,61 +130,285 @@ def load_airports():
 
 
 AIRPORTS = load_airports()
-AIRPORT_CODES = sorted(AIRPORTS.keys())
 
 
 def airport_label(code):
     a = AIRPORTS[code]
-    return f"{code} | {a['city']}, {a['country']} | {a['name']}"
+    return f"{code} - {a['city']}, {a['country']} ({a['name']})"
 
 
-AIRPORT_SEARCH_TEXT = {
-    code: f"{code} {a['city']} {a['country']} {a['name']}".lower()
-    for code, a in AIRPORTS.items()
-}
+# ============================================================
+# COUNTRY NAME + FLAG HELPERS FOR ALL COUNTRIES
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def build_country_display_name_map():
+    mapping = {}
+
+    for country in pycountry.countries:
+        alpha_2 = getattr(country, "alpha_2", "") or ""
+
+        if not alpha_2:
+            continue
+
+        display_name = (
+            getattr(country, "common_name", None)
+            or getattr(country, "name", None)
+            or alpha_2
+        )
+
+        mapping[alpha_2.upper()] = display_name
+
+    return mapping
 
 
-def smart_airport_picker(label, default_code, key):
-    st.markdown(f"**{label}**")
+COUNTRY_DISPLAY_NAME_MAP = build_country_display_name_map()
 
-    search_text = st.text_input(
-        f"Search {label}",
-        placeholder="Type airport code, city, country, or airport name",
-        key=f"{key}_search",
-        label_visibility="collapsed",
-    )
 
-    query = search_text.strip().lower()
+def country_display_name(country_value):
+    if not country_value:
+        return ""
 
-    if query:
-        tokens = query.split()
-        filtered_codes = [
-            code
-            for code in AIRPORT_CODES
-            if all(token in AIRPORT_SEARCH_TEXT[code] for token in tokens)
-        ]
-    else:
-        filtered_codes = [default_code] + [
-            code for code in AIRPORT_CODES if code != default_code
-        ]
+    code = str(country_value).strip().upper()
+    return COUNTRY_DISPLAY_NAME_MAP.get(code, code)
 
-    filtered_codes = filtered_codes[:150]
 
-    if not filtered_codes:
-        st.warning("No airport found. Try airport code like BKK, NRT, LHR, JFK, or city name.")
-        filtered_codes = [default_code]
+def country_flag_emoji(country_value):
+    code = str(country_value or "").strip().upper()
 
-    default_index = 0
-    if default_code in filtered_codes:
-        default_index = filtered_codes.index(default_code)
+    if len(code) != 2 or not code.isalpha():
+        return ""
 
-    selected_code = st.selectbox(
-        label,
-        filtered_codes,
-        index=default_index,
-        format_func=airport_label,
-        key=f"{key}_select",
-        label_visibility="collapsed",
+    try:
+        return "".join(chr(0x1F1E6 + ord(ch) - ord("A")) for ch in code)
+    except Exception:
+        return ""
+
+
+# ============================================================
+# SMART AIRPORT SEARCH
+#
+# Streamlit's own st.selectbox has a known, documented issue: its
+# built-in "fuzzy" client-side filter does not reliably behave as
+# exact-match-first (GitHub issue streamlit/streamlit #16003 - the
+# frontend search re-filters Streamlit's own fuzzy results with an
+# additional substring/fuzzy pass, so typing an exact IATA code can
+# still surface many loosely related options instead of only that
+# one airport). Since the desired behavior here is fully precise
+# and deterministic - typing "BKK" must return ONLY Bangkok's BKK,
+# while typing "Thailand" or "Japan" must return EVERY airport in
+# that country - we do not rely on the opaque built-in filter at
+# all. Instead we use the `streamlit-searchbox` component, which
+# calls our own Python search function on every keystroke (live,
+# no Enter needed) and renders exactly the results we return, in
+# the order we return them.
+#
+# pip install streamlit-searchbox
+# ============================================================
+
+@st.cache_data(show_spinner=False)
+def build_country_search_terms_map():
+    """
+    Full set of searchable terms per ISO alpha-2 country code:
+    alpha-2, alpha-3, short name, official name, common name.
+    Covers every country pycountry knows about.
+    """
+    mapping = {}
+
+    for country in pycountry.countries:
+        alpha_2 = getattr(country, "alpha_2", "") or ""
+
+        if not alpha_2:
+            continue
+
+        terms = set()
+
+        for value in [
+            alpha_2,
+            getattr(country, "alpha_3", "") or "",
+            getattr(country, "name", "") or "",
+            getattr(country, "official_name", "") or "",
+            getattr(country, "common_name", "") or "",
+        ]:
+            if value:
+                terms.add(value.lower())
+
+        mapping[alpha_2.upper()] = terms
+
+    return mapping
+
+
+COUNTRY_SEARCH_TERMS_MAP = build_country_search_terms_map()
+
+
+def country_search_terms(country_value):
+    code = str(country_value or "").strip().upper()
+    return COUNTRY_SEARCH_TERMS_MAP.get(code, {code.lower()} if code else set())
+
+
+@st.cache_data(show_spinner=False)
+def build_airport_rich_labels():
+    labels = {}
+
+    for code, info in AIRPORTS.items():
+        flag = country_flag_emoji(info.get("country", ""))
+        country_name = country_display_name(info.get("country", ""))
+        prefix = f"{flag} " if flag else ""
+
+        labels[code] = (
+            f"{prefix}{code} \u2014 {info.get('city', code)}, "
+            f"{country_name} ({info.get('name', code)})"
+        )
+
+    return labels
+
+
+AIRPORT_RICH_LABELS = build_airport_rich_labels()
+
+
+def airport_rich_label(code):
+    return AIRPORT_RICH_LABELS.get(code, code)
+
+
+@st.cache_data(show_spinner=False)
+def build_airport_search_index():
+    """
+    Precomputes, per airport code, the lowercase city, airport
+    name, country code, country display name, and the full set
+    of country search terms. Kept as raw fields (not one
+    flattened string) so the ranking function can tell exactly
+    which field matched.
+    """
+    index = {}
+
+    for code, info in AIRPORTS.items():
+        country_value = info.get("country", "")
+
+        index[code] = {
+            "code": code.lower(),
+            "city": str(info.get("city", "")).lower().strip(),
+            "name": str(info.get("name", "")).lower().strip(),
+            "country_code": str(country_value).lower().strip(),
+            "country_display": country_display_name(country_value).lower().strip(),
+            "country_terms": country_search_terms(country_value),
+        }
+
+    return index
+
+
+AIRPORT_SEARCH_INDEX = build_airport_search_index()
+
+
+def search_airports(query, limit=50):
+    """
+    Deterministic, fully controlled matching - no reliance on any
+    built-in fuzzy/browser filter. Priority (lower = shown first):
+      0 - exact IATA code match. If ANY code matches exactly, that
+          single result is returned alone (e.g. "BKK" -> only BKK),
+          since an exact code is unambiguous and should never be
+          diluted with loosely related airports.
+      1 - query exactly matches the country name (returns EVERY
+          airport in that country, e.g. "Thailand" or "Japan").
+      2 - country name starts with the query.
+      3 - query exactly matches the city (e.g. "Tokyo" -> every
+          airport serving Tokyo).
+      4 - city starts with the query.
+      5 - query appears anywhere in the country's search terms.
+      6 - query appears anywhere in the city name.
+      7 - query appears anywhere in the airport name.
+      8 - every query word appears somewhere across all fields.
+    """
+    query = query.strip().lower()
+
+    if not query:
+        return []
+
+    tokens = query.split()
+    results = []
+    exact_code_matches = []
+
+    for code, idx in AIRPORT_SEARCH_INDEX.items():
+        if idx["code"] == query:
+            exact_code_matches.append(code)
+            continue
+
+        priority = None
+
+        if query == idx["country_display"] or query in idx["country_terms"]:
+            priority = 1
+        elif idx["country_display"].startswith(query):
+            priority = 2
+        elif idx["city"] == query:
+            priority = 3
+        elif idx["city"].startswith(query):
+            priority = 4
+        elif any(query in term for term in idx["country_terms"]):
+            priority = 5
+        elif query in idx["city"]:
+            priority = 6
+        elif query in idx["name"]:
+            priority = 7
+        else:
+            combined = " ".join(
+                [
+                    idx["code"],
+                    idx["city"],
+                    idx["name"],
+                    idx["country_code"],
+                    idx["country_display"],
+                    " ".join(idx["country_terms"]),
+                ]
+            )
+
+            if all(tok in combined for tok in tokens):
+                priority = 8
+
+        if priority is not None:
+            results.append((priority, idx["city"], code))
+
+    # An exact IATA code match is unambiguous - return ONLY that,
+    # exactly matching the requirement that typing "BKK" shows
+    # nothing but Bangkok's BKK.
+    if exact_code_matches:
+        return sorted(exact_code_matches)[:limit]
+
+    results.sort(key=lambda r: (r[0], r[1]))
+
+    return [code for _, _, code in results[:limit]]
+
+
+def airport_search_function(searchterm):
+    """
+    Adapter for st_searchbox: called live on every keystroke with
+    the current search text, must return a list of (label, value)
+    tuples. Returns nothing until the user has typed something.
+    """
+    if not searchterm or not searchterm.strip():
+        return []
+
+    codes = search_airports(searchterm, limit=50)
+
+    return [(airport_rich_label(code), code) for code in codes]
+
+
+def smart_airport_select(label, default_code, key):
+    """
+    Renders one live search box (streamlit-searchbox): typing
+    calls airport_search_function on every keystroke - no Enter,
+    no blur, no button click needed - and the suggestion list
+    updates immediately below the box. default_code may be None,
+    in which case nothing is preselected and the field starts
+    empty until the user searches and picks an airport.
+    """
+    selected_code = st_searchbox(
+        airport_search_function,
+        key=f"{key}_searchbox",
+        label=label,
+        placeholder="Search a country, city, airport name, or IATA code",
+        default=default_code,
+        default_options=(
+            [airport_rich_label(default_code)] if default_code else []
+        ),
     )
 
     return selected_code
@@ -225,10 +477,7 @@ def norm_score(value, lo, hi, invert=False):
     t = (value - lo) / (hi - lo)
     t = max(0.0, min(1.0, t))
 
-    if invert:
-        return round((1 - t) * 100, 1)
-
-    return round(t * 100, 1)
+    return round((1 - t if invert else t) * 100, 1)
 
 
 def parse_hour(time_str):
@@ -247,27 +496,36 @@ def call_serpapi(params, api_key):
     p = dict(params)
     p["api_key"] = api_key
 
-    response = requests.get(
+    resp = requests.get(
         SERPAPI_URL,
         params=p,
         timeout=60,
     )
 
     try:
-        data = response.json()
+        data = resp.json()
     except Exception as exc:
         raise RuntimeError(
-            f"SerpAPI returned a non-JSON response. HTTP {response.status_code}"
+            f"SerpAPI returned a non-JSON response. HTTP {resp.status_code}"
         ) from exc
 
-    if response.status_code != 200:
-        raise RuntimeError(f"SerpAPI HTTP error: {response.status_code}")
-
-    if "error" in data:
-        raise RuntimeError(str(data.get("error")))
+    if resp.status_code != 200 or "error" in data:
+        raise RuntimeError(data.get("error", f"HTTP {resp.status_code}"))
 
     return data
 
+
+# ============================================================
+# OVERPASS NEARBY POINTS OF INTEREST
+#
+# 1. English names: request name:en (falling back to int_name /
+#    alt_name:en), preferring it over the local-language "name"
+#    tag for the display name.
+# 2. Quality ranking: flag a POI notable when it carries a
+#    wikipedia or wikidata tag (proxy for well documented,
+#    recognizable places). Sort notable-first, then by distance
+#    to the city center.
+# ============================================================
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def overpass_nearby(lat, lon, radius_m=3000):
@@ -284,12 +542,12 @@ def overpass_nearby(lat, lon, radius_m=3000):
     radius_m = max(500, min(radius_m, 8000))
 
     query = f"""
-    [out:json][timeout:20];
+    [out:json][timeout:25];
     (
-      nwraround:{radius_m},{lat},{lon};
-      nwraround:{radius_m},{lat},{lon};
+      nwr["tourism"~"attraction|museum|viewpoint|gallery|zoo|artwork"](around:{radius_m},{lat},{lon});
+      nwr["amenity"~"restaurant|cafe|bar"](around:{radius_m},{lat},{lon});
     );
-    out center tags 100;
+    out center tags 200;
     """
 
     headers = {
@@ -298,32 +556,39 @@ def overpass_nearby(lat, lon, radius_m=3000):
 
     for url in OVERPASS_URLS:
         try:
-            response = requests.post(
+            resp = requests.post(
                 url,
                 data={"data": query},
                 headers=headers,
-                timeout=25,
+                timeout=30,
             )
 
-            if response.status_code in (429, 500, 502, 503, 504):
+            if resp.status_code in (429, 500, 502, 503, 504):
                 continue
 
-            response.raise_for_status()
-            data = response.json()
+            resp.raise_for_status()
+            data = resp.json()
 
             rows = []
 
-            for element in data.get("elements", []):
-                tags = element.get("tags", {}) or {}
-                name = tags.get("name")
+            for el in data.get("elements", []):
+                tags = el.get("tags", {}) or {}
 
-                if not name:
+                local_name = tags.get("name")
+                english_name = (
+                    tags.get("name:en")
+                    or tags.get("int_name")
+                    or tags.get("alt_name:en")
+                )
+
+                display_name = english_name or local_name
+
+                if not display_name:
                     continue
 
-                center = element.get("center", {}) or {}
-
-                poi_lat = element.get("lat", center.get("lat"))
-                poi_lon = element.get("lon", center.get("lon"))
+                center = el.get("center", {}) or {}
+                poi_lat = el.get("lat", center.get("lat"))
+                poi_lon = el.get("lon", center.get("lon"))
 
                 if poi_lat is None or poi_lon is None:
                     continue
@@ -334,14 +599,23 @@ def overpass_nearby(lat, lon, radius_m=3000):
                     else "attraction"
                 )
 
+                is_notable = bool(
+                    tags.get("wikipedia") or tags.get("wikidata")
+                )
+
+                dist_from_center = haversine_km(lat, lon, poi_lat, poi_lon)
+
                 rows.append(
                     {
-                        "name": name,
+                        "name": display_name,
+                        "local_name": local_name,
                         "category": category,
                         "lat": poi_lat,
                         "lon": poi_lon,
                         "cuisine": tags.get("cuisine"),
                         "tourism_type": tags.get("tourism"),
+                        "notable": is_notable,
+                        "dist_from_center_km": round(dist_from_center, 2),
                     }
                 )
 
@@ -360,6 +634,11 @@ def overpass_nearby(lat, lon, radius_m=3000):
             df = df.dropna(subset=["lat", "lon"])
             df = df.drop_duplicates(subset=["name", "lat", "lon"])
 
+            df = df.sort_values(
+                by=["notable", "dist_from_center_km"],
+                ascending=[False, True],
+            ).reset_index(drop=True)
+
             return df[POI_COLUMNS].reset_index(drop=True)
 
         except Exception:
@@ -369,7 +648,7 @@ def overpass_nearby(lat, lon, radius_m=3000):
 
 
 def poi_count_near(df_pois, lat, lon, km=2.0):
-    if df_pois.empty:
+    if df_pois.empty or "lat" not in df_pois.columns:
         return 0
 
     valid = df_pois.dropna(subset=["lat", "lon"])
@@ -377,12 +656,12 @@ def poi_count_near(df_pois, lat, lon, km=2.0):
     if valid.empty:
         return 0
 
-    distances = valid.apply(
-        lambda row: haversine_km(lat, lon, row["lat"], row["lon"]),
+    d = valid.apply(
+        lambda r: haversine_km(lat, lon, r["lat"], r["lon"]),
         axis=1,
     )
 
-    return int((distances <= km).sum())
+    return int((d <= km).sum())
 
 
 # ============================================================
@@ -417,8 +696,8 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
     flight_rows = []
 
-    for flight in all_flights:
-        legs = flight.get("flights", [])
+    for f in all_flights:
+        legs = f.get("flights", [])
 
         if not legs:
             continue
@@ -428,8 +707,8 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
         flight_rows.append(
             {
-                "price": flight.get("price"),
-                "duration_min": flight.get("total_duration"),
+                "price": f.get("price"),
+                "duration_min": f.get("total_duration"),
                 "airline": first_leg.get("airline"),
                 "stops": len(legs) - 1,
                 "departure_time": first_leg.get("departure_airport", {}).get("time"),
@@ -446,7 +725,7 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     df_flights = df_flights.sort_values("price").reset_index(drop=True)
 
     if df_flights.empty:
-        raise RuntimeError("Flights were returned, but none had price data.")
+        raise RuntimeError("Flights were returned but none had price data.")
 
     hotel_json = call_serpapi(
         {
@@ -462,23 +741,23 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
     hotel_rows = []
 
-    for hotel in hotel_json.get("properties", []):
-        gps = hotel.get("gps_coordinates") or {}
+    for h in hotel_json.get("properties", []):
+        gps = h.get("gps_coordinates") or {}
 
         if "latitude" not in gps or "longitude" not in gps:
             continue
 
-        price = (hotel.get("rate_per_night") or {}).get("extracted_lowest")
+        price = (h.get("rate_per_night") or {}).get("extracted_lowest")
 
         hotel_rows.append(
             {
-                "name": hotel.get("name"),
+                "name": h.get("name"),
                 "price": price,
-                "rating": hotel.get("overall_rating"),
-                "reviews": hotel.get("reviews"),
+                "rating": h.get("overall_rating"),
+                "reviews": h.get("reviews"),
                 "lat": gps["latitude"],
                 "lon": gps["longitude"],
-                "link": hotel.get("link"),
+                "link": h.get("link"),
             }
         )
 
@@ -487,11 +766,10 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     if df_hotels.empty:
         raise RuntimeError("No hotels with location data were returned for this city.")
 
-    df_hotels = df_hotels.dropna(subset=["price", "rating", "lat", "lon"])
-    df_hotels = df_hotels.head(12)
+    df_hotels = df_hotels.dropna(subset=["price", "rating", "lat", "lon"]).head(12)
 
     if df_hotels.empty:
-        raise RuntimeError("No hotels with complete price, rating, and location data were returned.")
+        raise RuntimeError("No hotels with complete price/rating/location data were returned.")
 
     city_center_lat = df_hotels["lat"].mean()
     city_center_lon = df_hotels["lon"].mean()
@@ -503,10 +781,10 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     )
 
     df_hotels["airport_dist_km"] = df_hotels.apply(
-        lambda row: round(
+        lambda r: round(
             haversine_km(
-                row["lat"],
-                row["lon"],
+                r["lat"],
+                r["lon"],
                 arr["lat"],
                 arr["lon"],
             ),
@@ -516,10 +794,10 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     )
 
     df_hotels["poi_count"] = df_hotels.apply(
-        lambda row: poi_count_near(
+        lambda r: poi_count_near(
             df_pois,
-            row["lat"],
-            row["lon"],
+            r["lat"],
+            r["lon"],
         ),
         axis=1,
     )
@@ -538,12 +816,11 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
 def rank_hotels(df_hotels, weights):
     df = df_hotels.copy()
-
     wsum = sum(weights.values()) or 1
 
     df["price_score"] = df["price"].apply(
-        lambda value: norm_score(
-            value,
+        lambda v: norm_score(
+            v,
             df["price"].min(),
             df["price"].max(),
             invert=True,
@@ -553,8 +830,8 @@ def rank_hotels(df_hotels, weights):
     df["rating_score"] = (df["rating"] / 5 * 100).round(1)
 
     df["airport_score"] = df["airport_dist_km"].apply(
-        lambda value: norm_score(
-            value,
+        lambda v: norm_score(
+            v,
             df["airport_dist_km"].min(),
             df["airport_dist_km"].max(),
             invert=True,
@@ -562,8 +839,8 @@ def rank_hotels(df_hotels, weights):
     )
 
     df["poi_score"] = df["poi_count"].apply(
-        lambda value: norm_score(
-            value,
+        lambda v: norm_score(
+            v,
             df["poi_count"].min(),
             df["poi_count"].max(),
             invert=False,
@@ -585,21 +862,43 @@ def rank_hotels(df_hotels, weights):
 
 # ============================================================
 # DESIGN TOKENS
+#
+# Palette sourced directly from the user-provided "GENERAL
+# SPECTRUM" swatch strip (cream -> muted sage/teal -> slate ->
+# navy -> near-black), extracted by sampling the actual pixel
+# colors of the reference image. Two-tone layout, as requested:
+#   - Sidebar: darkest end of the spectrum (near-black backdrop,
+#     dark navy accent) - reads as "dark blue".
+#   - Main / results page: lightest end of the spectrum (cream
+#     background, muted slate-teal accent) - a light, modern
+#     look built from the same family of colors as the sidebar.
 # ============================================================
 
-BG = "#0A101E"
-PANEL = "#111A2E"
-PANEL_ALT = "#16213A"
-BORDER = "#22314F"
+# --- Main content / results page: light, from the spectrum's
+#     cream/sage end ---
+BG = "#F5F2E9"
+PANEL = "#FFFFFF"
+PANEL_ALT = "#ECE9DD"
+BORDER = "#D7D6C6"
+AMBER = "#46595F"
+AMBER_SOFT = "#E3E9E7"
+CYAN = "#5C6B57"
+ROSE = "#4A4C42"
+TEXT = "#20241E"
+TEXT_MUTED = "#6C7266"
+TEXT_DIM = "#98A091"
 
-AMBER = "#F5A623"
-AMBER_SOFT = "#3A2C12"
-CYAN = "#4FD1C5"
-ROSE = "#E2637A"
-
-TEXT = "#E7ECF3"
-TEXT_MUTED = "#8996AC"
-TEXT_DIM = "#5C6882"
+# --- Sidebar: dark, from the spectrum's navy/near-black end ---
+SB_BG = "#0A0F0D"
+SB_PANEL = "#122120"
+SB_PANEL_ALT = "#182B29"
+SB_BORDER = "#2A403D"
+SB_ACCENT = "#3E7C93"
+SB_ACCENT_SOFT = "#123543"
+SB_CYAN = "#6FA89A"
+SB_TEXT = "#EFF6F1"
+SB_TEXT_MUTED = "#93A69E"
+SB_TEXT_DIM = "#5D7268"
 
 
 # ============================================================
@@ -609,194 +908,297 @@ TEXT_DIM = "#5C6882"
 st.markdown(
     f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Sora:wght@500;600;700;800&family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 
 html, body, [class*="css"] {{
-    font-family: 'Inter', sans-serif;
+font-family: 'Plus Jakarta Sans', sans-serif;
 }}
 
+/* Main content / results page - light spectrum tones */
 .stApp {{
-    background: {BG};
-    color: {TEXT};
+background:
+radial-gradient(circle at 15% -10%, {AMBER_SOFT} 0%, transparent 45%),
+radial-gradient(circle at 100% 0%, {CYAN}14 0%, transparent 40%),
+{BG};
+color: {TEXT};
 }}
 
 h1, h2, h3, h4 {{
-    font-family: 'Space Grotesk', sans-serif !important;
-    font-weight: 600 !important;
+font-family: 'Sora', sans-serif !important;
+font-weight: 600 !important;
+color: {TEXT} !important;
 }}
 
+/* Sidebar - dark spectrum tones */
 [data-testid="stSidebar"] {{
-    background: {PANEL};
-    border-right: 1px solid {BORDER};
+background:
+radial-gradient(circle at 20% 0%, {SB_ACCENT_SOFT} 0%, transparent 55%),
+{SB_BG};
+border-right: 1px solid {SB_BORDER};
 }}
 
 [data-testid="stSidebar"] * {{
-    color: {TEXT};
+color: {SB_TEXT};
 }}
 
 [data-testid="stHeader"] {{
-    background: transparent;
+background: transparent;
 }}
 
 .fhp-eyebrow {{
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 12px;
-    letter-spacing: 3px;
-    color: {AMBER};
-    margin-bottom: 6px;
-    text-transform: uppercase;
+font-family: 'JetBrains Mono', monospace;
+font-size: 12px;
+letter-spacing: 3px;
+color: {AMBER};
+margin-bottom: 6px;
+text-transform: uppercase;
+}}
+
+/* Eyebrow labels inside the sidebar (SEARCH, RANKING WEIGHTS,
+   SHARE) use the sidebar's accent instead of the page's. */
+[data-testid="stSidebar"] .fhp-eyebrow {{
+color: {SB_ACCENT};
 }}
 
 .fhp-title {{
-    font-family: 'Space Grotesk', sans-serif;
-    font-weight: 700;
-    font-size: 34px;
-    margin: 0 0 6px;
-    color: {TEXT};
+font-family: 'Sora', sans-serif;
+font-weight: 800;
+font-size: 34px;
+margin: 0 0 6px;
+color: {TEXT};
+letter-spacing: -0.5px;
 }}
 
 .fhp-subtitle {{
-    color: {TEXT_MUTED};
-    font-size: 14px;
-    max-width: 720px;
-    line-height: 1.5;
-    margin-bottom: 8px;
+color: {TEXT_MUTED};
+font-size: 14px;
+max-width: 720px;
+line-height: 1.5;
+margin-bottom: 8px;
 }}
 
+/* Buttons: Search / Reset live in the sidebar, so the base
+   button style uses the sidebar's dark palette. */
 .stButton > button {{
-    border-radius: 8px;
-    border: 1px solid {BORDER};
-    background: {PANEL_ALT};
-    color: {TEXT};
-    font-family: 'Inter', sans-serif;
-    font-weight: 500;
+border-radius: 10px;
+border: 1px solid {SB_BORDER};
+background: {SB_PANEL_ALT};
+color: {SB_TEXT};
+font-family: 'Plus Jakarta Sans', sans-serif;
+font-weight: 500;
+transition: border-color 0.15s ease, transform 0.05s ease;
+}}
+
+.stButton > button:hover {{
+border-color: {SB_ACCENT};
+color: {SB_TEXT};
+}}
+
+.stButton > button:active {{
+transform: scale(0.98);
 }}
 
 .stButton > button[kind="primary"] {{
-    background: {AMBER};
-    color: #1A1206;
-    border: none;
-    font-weight: 600;
+background: linear-gradient(135deg, {SB_ACCENT} 0%, #245266 100%);
+color: #FFFFFF;
+border: none;
+font-weight: 700;
+box-shadow: 0 4px 16px {SB_ACCENT}55;
 }}
 
 .stButton > button[kind="primary"]:hover {{
-    background: #ffb84d;
-    color: #1A1206;
+filter: brightness(1.12);
+color: #FFFFFF;
 }}
 
+/* Download button lives in the main content area (EXPORT
+   section), so it follows the light page palette. */
 .stDownloadButton > button {{
-    border-radius: 8px;
-    border: 1px solid {BORDER};
-    background: {PANEL_ALT};
-    color: {TEXT};
+border-radius: 10px;
+border: 1px solid {BORDER};
+background: {PANEL_ALT};
+color: {TEXT};
+font-weight: 600;
 }}
 
+.stDownloadButton > button:hover {{
+border-color: {AMBER};
+color: {AMBER};
+}}
+
+/* Text inputs, date inputs, and selects all live inside the
+   sidebar (airport search, dates, currency). */
 [data-testid="stTextInput"] input,
 [data-testid="stDateInput"] input,
 [data-baseweb="select"] > div {{
-    background: {PANEL_ALT} !important;
-    border: 1px solid {BORDER} !important;
-    color: {TEXT} !important;
-    border-radius: 8px !important;
-    font-family: 'JetBrains Mono', monospace !important;
-    font-size: 13px !important;
+background: {SB_PANEL_ALT} !important;
+border: 1px solid {SB_BORDER} !important;
+color: {SB_TEXT} !important;
+border-radius: 8px !important;
+font-family: 'JetBrains Mono', monospace !important;
+font-size: 13px !important;
 }}
 
+/* Sliders (ranking weights, POI radius) also live in the
+   sidebar. */
 [data-testid="stSlider"] [role="slider"] {{
-    background-color: {AMBER} !important;
-    border-color: {AMBER} !important;
+background-color: {SB_ACCENT} !important;
+border-color: {SB_ACCENT} !important;
 }}
 
 [data-testid="stSlider"] div[data-baseweb="slider"] > div > div {{
-    background: {AMBER} !important;
+background: {SB_ACCENT} !important;
 }}
 
-[data-testid="stMetric"] {{
-    background: {PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 10px;
-    padding: 12px 16px;
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] {{
+color: {SB_TEXT_MUTED} !important;
 }}
 
-[data-testid="stMetricLabel"] {{
-    color: {TEXT_MUTED} !important;
-    font-size: 11px !important;
-    text-transform: uppercase;
-    letter-spacing: 1px;
-}}
-
-[data-testid="stMetricValue"] {{
-    color: {TEXT} !important;
-    font-family: 'JetBrains Mono', monospace !important;
-}}
-
+/* Main content: dataframe, expander, tabs - light page palette */
 [data-testid="stDataFrame"] {{
-    border: 1px solid {BORDER};
-    border-radius: 10px;
-    overflow: hidden;
+border: 1px solid {BORDER};
+border-radius: 10px;
+overflow: hidden;
 }}
 
 [data-testid="stExpander"] {{
-    border: 1px solid {BORDER};
-    border-radius: 10px;
-    background: {PANEL};
+border: 1px solid {BORDER};
+border-radius: 10px;
+background: {PANEL};
 }}
 
-hr {{
-    border-color: {BORDER};
+/* Share expander lives in the dark sidebar. The rule above sets
+   a light/white background (matching the light main-page style),
+   but the broad "[data-testid=stSidebar] *" text-color rule would
+   otherwise also paint its header text near-white, making it
+   unreadable on that white background. Force the header (and any
+   paragraph text inside it) to a dark color specifically here. */
+[data-testid="stSidebar"] [data-testid="stExpander"] {{
+border: 1px solid {SB_BORDER};
+}}
+
+[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary p,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary span,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary svg {{
+color: #1B1F30 !important;
+fill: #1B1F30 !important;
+font-weight: 600;
+}}
+
+[data-baseweb="tab-list"] {{
+gap: 4px;
+}}
+
+[data-baseweb="tab"] {{
+background: {PANEL_ALT};
+border: 1px solid {BORDER};
+border-radius: 20px !important;
+padding: 4px 16px !important;
+color: {TEXT_MUTED} !important;
+}}
+
+[aria-selected="true"][data-baseweb="tab"] {{
+background: {AMBER_SOFT} !important;
+color: {AMBER} !important;
+border-color: {AMBER} !important;
 }}
 
 .fhp-card {{
-    background: {PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 12px;
-    padding: 16px;
-    margin-bottom: 10px;
+background: {PANEL};
+border: 1px solid {BORDER};
+border-radius: 14px;
+padding: 16px;
+margin-bottom: 10px;
+box-shadow: 0 2px 10px rgba(32,36,30,0.06);
+transition: border-color 0.15s ease, box-shadow 0.15s ease;
+}}
+
+.fhp-card:hover {{
+border-color: {AMBER}88;
+box-shadow: 0 6px 18px rgba(70,89,95,0.14);
 }}
 
 .fhp-card-top1 {{
-    border-color: {AMBER};
+border-color: {AMBER};
+box-shadow: 0 6px 20px {AMBER}22;
 }}
 
 .fhp-rank {{
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    border-radius: 8px;
-    font-family: 'JetBrains Mono', monospace;
-    font-weight: 600;
-    font-size: 13px;
-    margin-right: 12px;
-    flex-shrink: 0;
+display: inline-flex;
+align-items: center;
+justify-content: center;
+width: 28px;
+height: 28px;
+border-radius: 8px;
+font-family: 'JetBrains Mono', monospace;
+font-weight: 600;
+font-size: 13px;
+margin-right: 12px;
+flex-shrink: 0;
 }}
 
 .fhp-score {{
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 20px;
-    font-weight: 600;
+font-family: 'JetBrains Mono', monospace;
+font-size: 20px;
+font-weight: 600;
 }}
 
 .fhp-bar-track {{
-    height: 4px;
-    background: {BORDER};
-    border-radius: 2px;
-    overflow: hidden;
+height: 4px;
+background: {BORDER};
+border-radius: 2px;
+overflow: hidden;
 }}
 
 .fhp-bar-fill {{
-    height: 100%;
-    background: {CYAN};
+height: 100%;
+background: {CYAN};
 }}
 
 .fhp-tag {{
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    font-size: 11px;
-    color: {TEXT_MUTED};
-    font-family: 'JetBrains Mono', monospace;
+display: inline-flex;
+align-items: center;
+gap: 4px;
+font-size: 11px;
+color: {TEXT_MUTED};
+font-family: 'JetBrains Mono', monospace;
+}}
+
+.fhp-badge-notable {{
+display: inline-flex;
+align-items: center;
+gap: 4px;
+font-size: 10px;
+color: {AMBER};
+font-family: 'JetBrains Mono', monospace;
+border: 1px solid {AMBER};
+border-radius: 6px;
+padding: 1px 6px;
+margin-left: 6px;
+background: {AMBER_SOFT};
+}}
+
+.fhp-search-divider {{
+height: 1px;
+background: linear-gradient(90deg, transparent, {SB_BORDER}, transparent);
+margin: 14px 0;
+}}
+
+/* Share QR section */
+.fhp-share-box {{
+background: {SB_PANEL};
+border: 1px solid {SB_BORDER};
+border-radius: 12px;
+padding: 14px;
+text-align: center;
+}}
+
+.fhp-share-caption {{
+color: {SB_TEXT_MUTED};
+font-size: 11px;
+margin-top: 8px;
+line-height: 1.5;
 }}
 </style>
 """,
@@ -808,23 +1210,16 @@ hr {{
 # HEADER
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow">FLIGHT PATH RECOMMENDER</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '<div class="fhp-title">Flight route + hotel recommender</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
+render_html('<div class="fhp-eyebrow">FLIGHT PATH RECOMMENDER</div>')
+render_html('<div class="fhp-title">Flight route + hotel recommender</div>')
+render_html(
     '<div class="fhp-subtitle">'
     'Real flight and hotel data via SerpAPI Google Flights and Google Hotels. '
-    'Nearby attractions and restaurants via OpenStreetMap Overpass. '
-    'Search any airport by code, city, country, or airport name.'
-    '</div>',
-    unsafe_allow_html=True,
+    'Nearby attractions and restaurants via OpenStreetMap Overpass, shown with '
+    'English names where available and ranked by notability and proximity. '
+    'Every IATA airport is searchable by country, city, airport name, or IATA code '
+    '- results filter live as you type, no need to press Enter.'
+    '</div>'
 )
 
 
@@ -840,31 +1235,82 @@ if "search_error" not in st.session_state:
 
 
 # ============================================================
+# SHARE QR CODE
+# Generates a QR code for the deployed app's public URL. Tries
+# a local render via the qrcode package first (crisper, no
+# network call at render time); if that package is not
+# installed, falls back to the free api.qrserver.com image API,
+# which needs no extra dependency at all.
+# ============================================================
+
+def render_share_qr_section():
+    render_html('<div class="fhp-eyebrow" style="margin-top:4px;">SHARE</div>')
+
+    with st.expander("Share this app", expanded=False):
+        qr_image = None
+
+        try:
+            import qrcode
+
+            qr = qrcode.QRCode(border=1, box_size=8)
+            qr.add_data(APP_SHARE_URL)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color=SB_TEXT, back_color=SB_PANEL)
+
+            buf = BytesIO()
+            img.save(buf, format="PNG")
+            qr_image = buf.getvalue()
+        except Exception:
+            qr_image = None
+
+        render_html('<div class="fhp-share-box">')
+
+        if qr_image:
+            st.image(qr_image, width=180)
+        else:
+            qr_api_url = (
+                "https://api.qrserver.com/v1/create-qr-code/"
+                f"?size=220x220&data={requests.utils.quote(APP_SHARE_URL, safe='')}"
+            )
+            st.image(qr_api_url, width=180)
+
+        render_html(
+            '<div class="fhp-share-caption">Scan to open this app on another device</div>'
+        )
+        render_html("</div>")
+
+        st.code(APP_SHARE_URL, language=None)
+
+
+# ============================================================
 # SIDEBAR
 # ============================================================
 
 with st.sidebar:
-    st.markdown(
-        '<div class="fhp-eyebrow" style="margin-top:-8px;">SEARCH</div>',
-        unsafe_allow_html=True,
+    render_html('<div class="fhp-eyebrow" style="margin-top:-8px;">SEARCH</div>')
+
+    st.success("SerpAPI key loaded automatically from Streamlit Secrets")
+
+    st.caption(
+        "Search by country (e.g. Japan, Thailand), city (e.g. Tokyo, Bangkok), "
+        "airport name, or exact IATA code (e.g. BKK). Results update as you type."
     )
 
-    st.success("SerpAPI key loaded from Streamlit Secrets")
-
-    default_dep = "BKK" if "BKK" in AIRPORTS else AIRPORT_CODES[0]
-    default_arr = "NRT" if "NRT" in AIRPORTS else AIRPORT_CODES[1]
-
-    dep_iata = smart_airport_picker(
+    # No pre-selected default airport for either field - the user
+    # must actively search and pick both before running a search.
+    dep_iata = smart_airport_select(
         label="Departure airport",
-        default_code=default_dep,
+        default_code=None,
         key="departure",
     )
 
-    arr_iata = smart_airport_picker(
+    arr_iata = smart_airport_select(
         label="Arrival airport",
-        default_code=default_arr,
+        default_code=None,
         key="arrival",
     )
+
+    render_html('<div class="fhp-search-divider"></div>')
 
     default_outbound = date.today() + timedelta(days=30)
     default_return = default_outbound + timedelta(days=5)
@@ -887,12 +1333,8 @@ with st.sidebar:
         index=1,
     )
 
-    st.markdown(
-        '<div class="fhp-eyebrow">RANKING WEIGHTS</div>',
-        unsafe_allow_html=True,
-    )
-
-    st.caption("These sliders recalculate the hotel ranking without another API call.")
+    render_html('<div class="fhp-eyebrow">RANKING WEIGHTS</div>')
+    st.caption("These apply instantly to whatever result is on screen. No need to search again.")
 
     w_price = st.slider("Price", 0, 100, 25, 5)
     w_rating = st.slider("Guest rating", 0, 100, 25, 5)
@@ -900,7 +1342,7 @@ with st.sidebar:
     w_poi = st.slider("Near attractions and restaurants", 0, 100, 25, 5)
 
     radius_m = st.slider(
-        "POI search radius in meters",
+        "POI search radius (m)",
         1000,
         8000,
         3000,
@@ -918,6 +1360,10 @@ with st.sidebar:
         use_container_width=True,
     )
 
+    render_html('<div class="fhp-search-divider"></div>')
+
+    render_share_qr_section()
+
 
 # ============================================================
 # BUTTON ACTIONS
@@ -930,13 +1376,16 @@ if reset_clicked:
 
 
 if search_clicked:
-    if dep_iata == arr_iata:
+    if not dep_iata or not arr_iata:
+        st.session_state.search_error = (
+            "Please search and select both a departure and an arrival airport first."
+        )
+
+    elif dep_iata == arr_iata:
         st.session_state.search_error = "Departure and arrival airports must be different."
-        st.session_state.raw = None
 
     elif return_date <= outbound_date:
         st.session_state.search_error = "Return date must be after outbound date."
-        st.session_state.raw = None
 
     else:
         st.session_state.search_error = None
@@ -965,8 +1414,9 @@ if st.session_state.search_error:
 if st.session_state.raw is None:
     if not st.session_state.search_error:
         st.info(
-            "Search airport by code, city, country, or airport name in the sidebar, then click Search. "
-            "The API key is loaded automatically from Streamlit Secrets."
+            "Search airport by country, city, airport name, or IATA code - the list "
+            "filters as you type. Example: type Japan to see airports in Japan, then "
+            "select one and click Search."
         )
 
     st.stop()
@@ -983,8 +1433,8 @@ arr = raw["arr"]
 
 dep_iata = raw["dep_iata"]
 arr_iata = raw["arr_iata"]
-currency = raw["currency"]
 
+currency = raw["currency"]
 df_flights = raw["df_flights"]
 df_pois = raw["df_pois"]
 
@@ -1002,28 +1452,19 @@ cheapest = df_flights.iloc[0]
 arrival_hour = parse_hour(cheapest["arrival_time"])
 is_night = arrival_hour is not None and (arrival_hour >= 22 or arrival_hour < 6)
 
-if pd.notna(cheapest["duration_min"]):
-    duration_str = (
-        f"{int(cheapest['duration_min'] // 60)}h "
-        f"{int(cheapest['duration_min'] % 60)}m"
-    )
-else:
-    duration_str = "n/a"
+duration_str = (
+    f"{int(cheapest['duration_min'] // 60)}h {int(cheapest['duration_min'] % 60)}m"
+    if pd.notna(cheapest["duration_min"])
+    else "n/a"
+)
 
 
 # ============================================================
-# ROUTE SUMMARY
+# ROUTE
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow" style="margin-top:28px;">ROUTE</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    f'<div class="fhp-title" style="font-size:22px;">{dep_iata} to {arr_iata}</div>',
-    unsafe_allow_html=True,
-)
+render_html('<div class="fhp-eyebrow" style="margin-top:28px;">ROUTE</div>')
+render_html(f'<div class="fhp-title" style="font-size:22px;">{dep_iata} to {arr_iata}</div>')
 
 stat_cols = st.columns(4)
 
@@ -1037,19 +1478,13 @@ stats = [
 for col, (label, value) in zip(stat_cols, stats):
     accent = AMBER if label == "Arrival window" else TEXT
 
-    col.markdown(
-        f"""
-        <div style="background:{PANEL};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;">
-            <div style="font-size:11px;color:{TEXT_MUTED};text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">
-                {label}
-            </div>
-            <div style="font-family:'JetBrains Mono',monospace;font-size:18px;color:{accent};">
-                {value}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    with col:
+        render_html(
+            f'<div style="background:{PANEL};border:1px solid {BORDER};border-radius:10px;padding:12px 16px;box-shadow:0 2px 8px rgba(32,36,30,0.05);">'
+            f'<div style="font-size:11px;color:{TEXT_MUTED};text-transform:uppercase;letter-spacing:1px;margin-bottom:4px;">{label}</div>'
+            f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:18px;color:{accent};">{value}</div>'
+            f'</div>'
+        )
 
 
 with st.expander(f"All {len(df_flights)} flight options"):
@@ -1064,22 +1499,13 @@ with st.expander(f"All {len(df_flights)} flight options"):
 # HOTELS
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow" style="margin-top:32px;">HOTELS</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    f'<div class="fhp-title" style="font-size:22px;">Recommended in {arr["city"]}</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
+render_html('<div class="fhp-eyebrow" style="margin-top:32px;">HOTELS</div>')
+render_html(f'<div class="fhp-title" style="font-size:22px;">Recommended in {arr["city"]}</div>')
+render_html(
     '<div class="fhp-subtitle">'
     'Score blends price, guest rating, distance to the arrival airport, '
-    'and nearby attractions or restaurants. Adjust the sliders in the sidebar.'
-    '</div>',
-    unsafe_allow_html=True,
+    'and density of nearby attractions/restaurants, weighted by your sidebar sliders.'
+    '</div>'
 )
 
 hotel_display = (
@@ -1105,110 +1531,67 @@ hotel_display = (
     .round({"score": 1})
 )
 
-cards_html = []
-
-for _, hotel in df_hotels.iterrows():
-    is_top = hotel["rank"] == 1
+for _, h in df_hotels.iterrows():
+    is_top = h["rank"] == 1
 
     rank_bg = AMBER_SOFT if is_top else PANEL_ALT
     rank_color = AMBER if is_top else TEXT_MUTED
 
     bars = [
-        ("Price", hotel["price_score"]),
-        ("Rating", hotel["rating_score"]),
-        ("Airport", hotel["airport_score"]),
-        ("Nearby", hotel["poi_score"]),
+        ("Price", h["price_score"]),
+        ("Rating", h["rating_score"]),
+        ("Airport", h["airport_score"]),
+        ("Nearby", h["poi_score"]),
     ]
 
-    bars_html = ""
+    bar_parts = []
+    for label, b in bars:
+        bar_parts.append(
+            f'<div style="flex:1;min-width:70px;">'
+            f'<div class="fhp-bar-track"><div class="fhp-bar-fill" style="width:{b}%;"></div></div>'
+            f'<div style="font-size:10px;color:{TEXT_DIM};margin-top:3px;">{label}</div>'
+            f'</div>'
+        )
+    bars_html = "".join(bar_parts)
 
-    for label, score in bars:
-        bars_html += f"""
-        <div style="flex:1;min-width:70px;">
-            <div class="fhp-bar-track">
-                <div class="fhp-bar-fill" style="width:{score}%;"></div>
-            </div>
-            <div style="font-size:10px;color:{TEXT_DIM};margin-top:3px;">
-                {label}
-            </div>
-        </div>
-        """
-
-    rating_value = hotel["rating"] if pd.notna(hotel["rating"]) else 0
+    rating_value = h["rating"] if pd.notna(h["rating"]) else 0
     full_stars = max(0, min(5, round(rating_value)))
-    stars = "★" * full_stars + "☆" * (5 - full_stars)
+    stars = "\u2605" * full_stars + "\u2606" * (5 - full_stars)
 
-    reviews_value = int(hotel["reviews"]) if pd.notna(hotel["reviews"]) else 0
+    reviews_value = int(h["reviews"]) if pd.notna(h["reviews"]) else 0
 
-    cards_html.append(
-        f"""
-        <div class="fhp-card{' fhp-card-top1' if is_top else ''}">
-            <div style="display:flex;gap:14px;flex-wrap:wrap;">
-                <div class="fhp-rank" style="background:{rank_bg};color:{rank_color};">
-                    {hotel['rank']}
-                </div>
-
-                <div style="flex:1;min-width:220px;">
-                    <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
-                        <div style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px;">
-                            {hotel['name']}
-                        </div>
-
-                        <div style="font-family:'JetBrains Mono',monospace;font-size:15px;color:{AMBER};">
-                            {hotel['price']} {currency}
-                            <span style="color:{TEXT_MUTED};font-size:11px;"> /night</span>
-                        </div>
-                    </div>
-
-                    <div style="display:flex;gap:16px;flex-wrap:wrap;margin:6px 0 10px;">
-                        <span class="fhp-tag" style="color:{AMBER};">
-                            {stars}
-                            <span style="color:{TEXT_MUTED};">
-                                &nbsp;{hotel['rating']} ({reviews_value})
-                            </span>
-                        </span>
-
-                        <span class="fhp-tag">
-                            Airport {hotel['airport_dist_km']} km
-                        </span>
-
-                        <span class="fhp-tag">
-                            Nearby {hotel['poi_count']} spots
-                        </span>
-                    </div>
-
-                    <div style="display:flex;gap:10px;flex-wrap:wrap;">
-                        {bars_html}
-                    </div>
-                </div>
-
-                <div class="fhp-score" style="align-self:center;color:{AMBER if is_top else TEXT};min-width:46px;text-align:right;">
-                    {hotel['composite']:.0f}
-                </div>
-            </div>
-        </div>
-        """
+    card_html = (
+        f'<div class="fhp-card{" fhp-card-top1" if is_top else ""}">'
+        f'<div style="display:flex;gap:14px;flex-wrap:wrap;">'
+        f'<div class="fhp-rank" style="background:{rank_bg};color:{rank_color};">{h["rank"]}</div>'
+        f'<div style="flex:1;min-width:220px;">'
+        f'<div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">'
+        f'<div style="font-family:\'Sora\',sans-serif;font-weight:600;font-size:15px;">{h["name"]}</div>'
+        f'<div style="font-family:\'JetBrains Mono\',monospace;font-size:15px;color:{AMBER};">{h["price"]} {currency}'
+        f'<span style="color:{TEXT_MUTED};font-size:11px;"> /night</span></div>'
+        f'</div>'
+        f'<div style="display:flex;gap:16px;flex-wrap:wrap;margin:6px 0 10px;">'
+        f'<span class="fhp-tag" style="color:{AMBER};">{stars}'
+        f'<span style="color:{TEXT_MUTED};">&nbsp;{h["rating"]} ({reviews_value})</span></span>'
+        f'<span class="fhp-tag">Airport {h["airport_dist_km"]} km</span>'
+        f'<span class="fhp-tag">Nearby {h["poi_count"]} spots</span>'
+        f'</div>'
+        f'<div style="display:flex;gap:10px;flex-wrap:wrap;">{bars_html}</div>'
+        f'</div>'
+        f'<div class="fhp-score" style="align-self:center;color:{AMBER if is_top else TEXT};min-width:46px;text-align:right;">{h["composite"]:.0f}</div>'
+        f'</div>'
+        f'</div>'
     )
 
-st.markdown(
-    "".join(cards_html),
-    unsafe_allow_html=True,
-)
+    render_html(card_html)
 
 
 # ============================================================
 # MAP
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow" style="margin-top:28px;">MAP</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    '<div class="fhp-title" style="font-size:22px;">Route and destination</div>',
-    unsafe_allow_html=True,
-)
+render_html('<div class="fhp-eyebrow" style="margin-top:28px;">MAP</div>')
+render_html('<div class="fhp-title" style="font-size:22px;">Route and destination</div>')
 
 m = folium.Map(
     location=[
@@ -1246,29 +1629,27 @@ folium.Marker(
     icon=folium.Icon(color="blue", icon="plane", prefix="fa"),
 ).add_to(m)
 
-for _, hotel in df_hotels.iterrows():
-    marker_color = "orange" if hotel["rank"] == 1 else "cadetblue"
+for _, h in df_hotels.iterrows():
+    color = "orange" if h["rank"] == 1 else "cadetblue"
 
     folium.Marker(
-        [hotel["lat"], hotel["lon"]],
-        tooltip=(
-            f"#{hotel['rank']} {hotel['name']} | "
-            f"{hotel['price']} {currency}, score {hotel['composite']:.0f}"
-        ),
-        icon=folium.Icon(color=marker_color, icon="bed", prefix="fa"),
+        [h["lat"], h["lon"]],
+        tooltip=f"#{h['rank']} {h['name']} | {h['price']} {currency}, score {h['composite']:.0f}",
+        icon=folium.Icon(color=color, icon="bed", prefix="fa"),
     ).add_to(m)
 
 if not df_pois.empty:
     for _, poi in df_pois.dropna(subset=["lat", "lon"]).head(60).iterrows():
-        poi_color = CYAN if poi["category"] == "attraction" else ROSE
+        color = CYAN if poi["category"] == "attraction" else ROSE
+        star_prefix = "* " if poi.get("notable") else ""
 
         folium.CircleMarker(
             [poi["lat"], poi["lon"]],
             radius=4,
-            color=poi_color,
+            color=color,
             fill=True,
             fill_opacity=0.8,
-            tooltip=f"{poi['name']} ({poi['category']})",
+            tooltip=f"{star_prefix}{poi['name']} ({poi['category']})",
         ).add_to(m)
 
 bounds = (
@@ -1278,10 +1659,7 @@ bounds = (
 
 m.fit_bounds(bounds)
 
-st.markdown(
-    f'<div style="border:1px solid {BORDER};border-radius:12px;overflow:hidden;">',
-    unsafe_allow_html=True,
-)
+render_html(f'<div style="border:1px solid {BORDER};border-radius:12px;overflow:hidden;">')
 
 components.html(
     m._repr_html_(),
@@ -1289,31 +1667,29 @@ components.html(
     scrolling=False,
 )
 
-st.markdown(
-    "</div>",
-    unsafe_allow_html=True,
-)
+render_html("</div>")
 
 
 # ============================================================
 # NEARBY
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow" style="margin-top:32px;">NEARBY</div>',
-    unsafe_allow_html=True,
-)
-
-st.markdown(
-    f'<div class="fhp-title" style="font-size:22px;">In {arr["city"]}</div>',
-    unsafe_allow_html=True,
+render_html('<div class="fhp-eyebrow" style="margin-top:32px;">NEARBY</div>')
+render_html(f'<div class="fhp-title" style="font-size:22px;">In {arr["city"]}</div>')
+render_html(
+    '<div class="fhp-subtitle">'
+    'English names are shown where OpenStreetMap has one tagged; otherwise the local '
+    f'name is shown. Places marked <span style="color:{AMBER};font-weight:600;">Notable</span> '
+    'have a Wikipedia or Wikidata reference, used as a proxy for well-known, worth-visiting '
+    'spots. The list leads with notable, centrally located places first.'
+    '</div>'
 )
 
 if df_pois.empty:
     st.caption(
         "No attractions or restaurants found from Overpass. "
         "This can happen if the public Overpass server is busy, blocked, "
-        "or there are no OpenStreetMap results in the selected radius."
+        "or there are no OSM results in the selected radius."
     )
 
 else:
@@ -1325,25 +1701,23 @@ else:
         ["All", "Attractions", "Restaurants"]
     )
 
-    for tab, category_filter in [
+    for tab, cat in [
         (tab_all, None),
         (tab_attr, "attraction"),
         (tab_food, "restaurant"),
     ]:
         with tab:
-            shown = (
-                df_pois
-                if category_filter is None
-                else df_pois[df_pois["category"] == category_filter]
-            )
+            shown = df_pois if cat is None else df_pois[df_pois["category"] == cat]
+
+            shown = shown.head(30)
 
             if shown.empty:
                 st.caption("No records found for this category.")
                 continue
 
-            poi_cards = []
+            cols = st.columns(3)
 
-            for _, poi in shown.iterrows():
+            for i, (_, poi) in enumerate(shown.iterrows()):
                 is_food = poi["category"] == "restaurant"
                 icon = "Food" if is_food else "Place"
                 color = ROSE if is_food else CYAN
@@ -1355,44 +1729,46 @@ else:
                 else:
                     meta = poi["category"]
 
-                poi_cards.append(
-                    f"""
-                    <div style="background:{PANEL};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;">
-                        <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-                            <span style="color:{color};font-size:11px;font-family:'JetBrains Mono',monospace;">
-                                {icon}
-                            </span>
-                            <span style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;">
-                                {poi['name']}
-                            </span>
-                        </div>
-                        <div class="fhp-tag">{meta or ''}</div>
-                    </div>
-                    """
+                show_local = (
+                    pd.notna(poi.get("local_name"))
+                    and poi.get("local_name")
+                    and poi.get("local_name") != poi.get("name")
                 )
 
-            cols = st.columns(3)
-
-            for i, card in enumerate(poi_cards):
-                cols[i % 3].markdown(
-                    card,
-                    unsafe_allow_html=True,
+                local_name_html = (
+                    f'<div style="font-size:10px;color:{TEXT_DIM};margin-top:2px;">{poi["local_name"]}</div>'
+                    if show_local
+                    else ""
                 )
 
-                cols[i % 3].markdown(
-                    "<div style='height:8px;'></div>",
-                    unsafe_allow_html=True,
+                notable_badge_html = (
+                    '<span class="fhp-badge-notable">Notable</span>'
+                    if poi.get("notable")
+                    else ""
                 )
+
+                poi_card_html = (
+                    f'<div style="background:{PANEL};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;box-shadow:0 2px 8px rgba(32,36,30,0.05);">'
+                    f'<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">'
+                    f'<span style="color:{color};font-size:11px;font-family:\'JetBrains Mono\',monospace;">{icon}</span>'
+                    f'<span style="font-family:\'Sora\',sans-serif;font-weight:600;font-size:13px;">{poi["name"]}</span>'
+                    f'{notable_badge_html}'
+                    f'</div>'
+                    f'{local_name_html}'
+                    f'<div class="fhp-tag" style="margin-top:4px;">{meta or ""}</div>'
+                    f'</div>'
+                )
+
+                with cols[i % 3]:
+                    render_html(poi_card_html)
+                    render_html("<div style='height:8px;'></div>")
 
 
 # ============================================================
 # EXPORT
 # ============================================================
 
-st.markdown(
-    '<div class="fhp-eyebrow" style="margin-top:32px;">EXPORT</div>',
-    unsafe_allow_html=True,
-)
+render_html('<div class="fhp-eyebrow" style="margin-top:32px;">EXPORT</div>')
 
 csv_data = hotel_display.to_csv(index=False).encode("utf-8")
 
@@ -1404,11 +1780,10 @@ st.download_button(
     use_container_width=True,
 )
 
-st.markdown(
+render_html(
     f'<div style="color:{TEXT_DIM};font-size:12px;margin-top:12px;">'
     'Data: SerpAPI Google Flights, SerpAPI Google Hotels, '
     'OpenStreetMap contributors via Overpass API, '
     'and airport data via OurAirports public domain.'
-    '</div>',
-    unsafe_allow_html=True,
+    '</div>'
 )
