@@ -1,3 +1,4 @@
+import os
 import math
 from datetime import date, timedelta
 
@@ -21,18 +22,39 @@ st.set_page_config(
 
 
 # ============================================================
-# SECRET API KEY
+# SECRET LOADER
 # ============================================================
 
-try:
-    SERPAPI_KEY = st.secrets["SERPAPI_KEY"]
-except KeyError:
-    st.error(
-        "SERPAPI_KEY was not found in Streamlit Secrets. "
-        "Go to Streamlit Community Cloud > App settings > Secrets, then add: "
-        'SERPAPI_KEY = "your_key_here"'
-    )
-    st.stop()
+def get_serpapi_key():
+    key = None
+
+    try:
+        key = st.secrets.get("SERPAPI_KEY", None)
+    except Exception:
+        key = None
+
+    if not key:
+        key = os.environ.get("SERPAPI_KEY")
+
+    if not key:
+        st.error(
+            "SERPAPI_KEY was not found. Please add this in Streamlit Community Cloud > App settings > Secrets:\n\n"
+            'SERPAPI_KEY = "your_serpapi_key_here"'
+        )
+
+        with st.expander("Debug secret status"):
+            try:
+                st.write("Available secret keys:", list(st.secrets.keys()))
+            except Exception as e:
+                st.write("Could not read Streamlit secrets.")
+                st.write(str(e))
+
+        st.stop()
+
+    return str(key).strip()
+
+
+SERPAPI_KEY = get_serpapi_key()
 
 
 # ============================================================
@@ -50,7 +72,7 @@ POI_COLUMNS = ["name", "category", "lat", "lon", "cuisine", "tourism_type"]
 
 
 # ============================================================
-# AIRPORTS
+# AIRPORT DATA
 # ============================================================
 
 @st.cache_data(show_spinner=False)
@@ -59,9 +81,13 @@ def load_airports():
     cleaned = {}
 
     for code, info in raw.items():
-        lat, lon = info.get("lat"), info.get("lon")
+        lat = info.get("lat")
+        lon = info.get("lon")
 
-        if not code or lat in (None, 0) or lon in (None, 0):
+        if not code:
+            continue
+
+        if lat in (None, 0) or lon in (None, 0):
             continue
 
         cleaned[code] = {
@@ -81,7 +107,59 @@ AIRPORT_CODES = sorted(AIRPORTS.keys())
 
 def airport_label(code):
     a = AIRPORTS[code]
-    return f"{code} - {a['city']}, {a['country']} ({a['name']})"
+    return f"{code} | {a['city']}, {a['country']} | {a['name']}"
+
+
+AIRPORT_SEARCH_TEXT = {
+    code: f"{code} {a['city']} {a['country']} {a['name']}".lower()
+    for code, a in AIRPORTS.items()
+}
+
+
+def smart_airport_picker(label, default_code, key):
+    st.markdown(f"**{label}**")
+
+    search_text = st.text_input(
+        f"Search {label}",
+        placeholder="Type airport code, city, country, or airport name",
+        key=f"{key}_search",
+        label_visibility="collapsed",
+    )
+
+    query = search_text.strip().lower()
+
+    if query:
+        tokens = query.split()
+        filtered_codes = [
+            code
+            for code in AIRPORT_CODES
+            if all(token in AIRPORT_SEARCH_TEXT[code] for token in tokens)
+        ]
+    else:
+        filtered_codes = [default_code] + [
+            code for code in AIRPORT_CODES if code != default_code
+        ]
+
+    filtered_codes = filtered_codes[:150]
+
+    if not filtered_codes:
+        st.warning("No airport found. Try airport code like BKK, NRT, LHR, JFK, or city name.")
+        filtered_codes = [default_code]
+
+    default_index = 0
+    if default_code in filtered_codes:
+        default_index = filtered_codes.index(default_code)
+
+    selected_code = st.selectbox(
+        label,
+        filtered_codes,
+        index=default_index,
+        format_func=airport_label,
+        key=f"{key}_select",
+        label_visibility="collapsed",
+    )
+
+    return selected_code
 
 
 # ============================================================
@@ -169,17 +247,24 @@ def call_serpapi(params, api_key):
     p = dict(params)
     p["api_key"] = api_key
 
-    resp = requests.get(SERPAPI_URL, params=p, timeout=60)
+    response = requests.get(
+        SERPAPI_URL,
+        params=p,
+        timeout=60,
+    )
 
     try:
-        data = resp.json()
+        data = response.json()
     except Exception as exc:
         raise RuntimeError(
-            f"SerpAPI returned a non-JSON response. HTTP {resp.status_code}"
+            f"SerpAPI returned a non-JSON response. HTTP {response.status_code}"
         ) from exc
 
-    if resp.status_code != 200 or "error" in data:
-        raise RuntimeError(data.get("error", f"HTTP {resp.status_code}"))
+    if response.status_code != 200:
+        raise RuntimeError(f"SerpAPI HTTP error: {response.status_code}")
+
+    if "error" in data:
+        raise RuntimeError(str(data.get("error")))
 
     return data
 
@@ -213,32 +298,32 @@ def overpass_nearby(lat, lon, radius_m=3000):
 
     for url in OVERPASS_URLS:
         try:
-            resp = requests.post(
+            response = requests.post(
                 url,
                 data={"data": query},
                 headers=headers,
                 timeout=25,
             )
 
-            if resp.status_code in (429, 500, 502, 503, 504):
+            if response.status_code in (429, 500, 502, 503, 504):
                 continue
 
-            resp.raise_for_status()
-            data = resp.json()
+            response.raise_for_status()
+            data = response.json()
 
             rows = []
 
-            for el in data.get("elements", []):
-                tags = el.get("tags", {}) or {}
+            for element in data.get("elements", []):
+                tags = element.get("tags", {}) or {}
                 name = tags.get("name")
 
                 if not name:
                     continue
 
-                center = el.get("center", {}) or {}
+                center = element.get("center", {}) or {}
 
-                poi_lat = el.get("lat", center.get("lat"))
-                poi_lon = el.get("lon", center.get("lon"))
+                poi_lat = element.get("lat", center.get("lat"))
+                poi_lon = element.get("lon", center.get("lon"))
 
                 if poi_lat is None or poi_lon is None:
                     continue
@@ -284,7 +369,7 @@ def overpass_nearby(lat, lon, radius_m=3000):
 
 
 def poi_count_near(df_pois, lat, lon, km=2.0):
-    if df_pois.empty or "lat" not in df_pois.columns:
+    if df_pois.empty:
         return 0
 
     valid = df_pois.dropna(subset=["lat", "lon"])
@@ -292,12 +377,12 @@ def poi_count_near(df_pois, lat, lon, km=2.0):
     if valid.empty:
         return 0
 
-    d = valid.apply(
-        lambda r: haversine_km(lat, lon, r["lat"], r["lon"]),
+    distances = valid.apply(
+        lambda row: haversine_km(lat, lon, row["lat"], row["lon"]),
         axis=1,
     )
 
-    return int((d <= km).sum())
+    return int((distances <= km).sum())
 
 
 # ============================================================
@@ -332,8 +417,8 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
     flight_rows = []
 
-    for f in all_flights:
-        legs = f.get("flights", [])
+    for flight in all_flights:
+        legs = flight.get("flights", [])
 
         if not legs:
             continue
@@ -343,8 +428,8 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
         flight_rows.append(
             {
-                "price": f.get("price"),
-                "duration_min": f.get("total_duration"),
+                "price": flight.get("price"),
+                "duration_min": flight.get("total_duration"),
                 "airline": first_leg.get("airline"),
                 "stops": len(legs) - 1,
                 "departure_time": first_leg.get("departure_airport", {}).get("time"),
@@ -361,7 +446,7 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     df_flights = df_flights.sort_values("price").reset_index(drop=True)
 
     if df_flights.empty:
-        raise RuntimeError("Flights were returned but none had price data.")
+        raise RuntimeError("Flights were returned, but none had price data.")
 
     hotel_json = call_serpapi(
         {
@@ -377,23 +462,23 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
 
     hotel_rows = []
 
-    for h in hotel_json.get("properties", []):
-        gps = h.get("gps_coordinates") or {}
+    for hotel in hotel_json.get("properties", []):
+        gps = hotel.get("gps_coordinates") or {}
 
         if "latitude" not in gps or "longitude" not in gps:
             continue
 
-        price = (h.get("rate_per_night") or {}).get("extracted_lowest")
+        price = (hotel.get("rate_per_night") or {}).get("extracted_lowest")
 
         hotel_rows.append(
             {
-                "name": h.get("name"),
+                "name": hotel.get("name"),
                 "price": price,
-                "rating": h.get("overall_rating"),
-                "reviews": h.get("reviews"),
+                "rating": hotel.get("overall_rating"),
+                "reviews": hotel.get("reviews"),
                 "lat": gps["latitude"],
                 "lon": gps["longitude"],
-                "link": h.get("link"),
+                "link": hotel.get("link"),
             }
         )
 
@@ -402,7 +487,8 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     if df_hotels.empty:
         raise RuntimeError("No hotels with location data were returned for this city.")
 
-    df_hotels = df_hotels.dropna(subset=["price", "rating", "lat", "lon"]).head(12)
+    df_hotels = df_hotels.dropna(subset=["price", "rating", "lat", "lon"])
+    df_hotels = df_hotels.head(12)
 
     if df_hotels.empty:
         raise RuntimeError("No hotels with complete price, rating, and location data were returned.")
@@ -410,18 +496,31 @@ def run_search(api_key, dep_iata, arr_iata, outbound_date, return_date, currency
     city_center_lat = df_hotels["lat"].mean()
     city_center_lon = df_hotels["lon"].mean()
 
-    df_pois = overpass_nearby(city_center_lat, city_center_lon, radius_m)
+    df_pois = overpass_nearby(
+        city_center_lat,
+        city_center_lon,
+        radius_m,
+    )
 
     df_hotels["airport_dist_km"] = df_hotels.apply(
-        lambda r: round(
-            haversine_km(r["lat"], r["lon"], arr["lat"], arr["lon"]),
+        lambda row: round(
+            haversine_km(
+                row["lat"],
+                row["lon"],
+                arr["lat"],
+                arr["lon"],
+            ),
             1,
         ),
         axis=1,
     )
 
     df_hotels["poi_count"] = df_hotels.apply(
-        lambda r: poi_count_near(df_pois, r["lat"], r["lon"]),
+        lambda row: poi_count_near(
+            df_pois,
+            row["lat"],
+            row["lon"],
+        ),
         axis=1,
     )
 
@@ -443,8 +542,8 @@ def rank_hotels(df_hotels, weights):
     wsum = sum(weights.values()) or 1
 
     df["price_score"] = df["price"].apply(
-        lambda v: norm_score(
-            v,
+        lambda value: norm_score(
+            value,
             df["price"].min(),
             df["price"].max(),
             invert=True,
@@ -454,8 +553,8 @@ def rank_hotels(df_hotels, weights):
     df["rating_score"] = (df["rating"] / 5 * 100).round(1)
 
     df["airport_score"] = df["airport_dist_km"].apply(
-        lambda v: norm_score(
-            v,
+        lambda value: norm_score(
+            value,
             df["airport_dist_km"].min(),
             df["airport_dist_km"].max(),
             invert=True,
@@ -463,8 +562,8 @@ def rank_hotels(df_hotels, weights):
     )
 
     df["poi_score"] = df["poi_count"].apply(
-        lambda v: norm_score(
-            v,
+        lambda value: norm_score(
+            value,
             df["poi_count"].min(),
             df["poi_count"].max(),
             invert=False,
@@ -559,7 +658,7 @@ h1, h2, h3, h4 {{
 .fhp-subtitle {{
     color: {TEXT_MUTED};
     font-size: 14px;
-    max-width: 680px;
+    max-width: 720px;
     line-height: 1.5;
     margin-bottom: 8px;
 }}
@@ -629,29 +728,6 @@ h1, h2, h3, h4 {{
 [data-testid="stMetricValue"] {{
     color: {TEXT} !important;
     font-family: 'JetBrains Mono', monospace !important;
-}}
-
-[data-testid="stAlertContentInfo"],
-.stAlert {{
-    border-radius: 10px;
-}}
-
-[data-baseweb="tab-list"] {{
-    gap: 4px;
-}}
-
-[data-baseweb="tab"] {{
-    background: {PANEL};
-    border: 1px solid {BORDER};
-    border-radius: 20px !important;
-    padding: 4px 16px !important;
-    color: {TEXT_MUTED} !important;
-}}
-
-[aria-selected="true"][data-baseweb="tab"] {{
-    background: {AMBER_SOFT} !important;
-    color: {AMBER} !important;
-    border-color: {AMBER} !important;
 }}
 
 [data-testid="stDataFrame"] {{
@@ -746,7 +822,7 @@ st.markdown(
     '<div class="fhp-subtitle">'
     'Real flight and hotel data via SerpAPI Google Flights and Google Hotels. '
     'Nearby attractions and restaurants via OpenStreetMap Overpass. '
-    'Every IATA airport is supported.'
+    'Search any airport by code, city, country, or airport name.'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -773,23 +849,21 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.caption("SerpAPI key is loaded automatically from Streamlit Secrets.")
+    st.success("SerpAPI key loaded from Streamlit Secrets")
 
-    default_dep = AIRPORT_CODES.index("BKK") if "BKK" in AIRPORTS else 0
-    default_arr = AIRPORT_CODES.index("NRT") if "NRT" in AIRPORTS else 0
+    default_dep = "BKK" if "BKK" in AIRPORTS else AIRPORT_CODES[0]
+    default_arr = "NRT" if "NRT" in AIRPORTS else AIRPORT_CODES[1]
 
-    dep_iata = st.selectbox(
-        "Departure airport",
-        AIRPORT_CODES,
-        index=default_dep,
-        format_func=airport_label,
+    dep_iata = smart_airport_picker(
+        label="Departure airport",
+        default_code=default_dep,
+        key="departure",
     )
 
-    arr_iata = st.selectbox(
-        "Arrival airport",
-        AIRPORT_CODES,
-        index=default_arr,
-        format_func=airport_label,
+    arr_iata = smart_airport_picker(
+        label="Arrival airport",
+        default_code=default_arr,
+        key="arrival",
     )
 
     default_outbound = date.today() + timedelta(days=30)
@@ -818,10 +892,7 @@ with st.sidebar:
         unsafe_allow_html=True,
     )
 
-    st.caption(
-        "These apply instantly to whatever result is on screen. "
-        "No need to search again."
-    )
+    st.caption("These sliders recalculate the hotel ranking without another API call.")
 
     w_price = st.slider("Price", 0, 100, 25, 5)
     w_rating = st.slider("Guest rating", 0, 100, 25, 5)
@@ -829,7 +900,7 @@ with st.sidebar:
     w_poi = st.slider("Near attractions and restaurants", 0, 100, 25, 5)
 
     radius_m = st.slider(
-        "POI search radius (m)",
+        "POI search radius in meters",
         1000,
         8000,
         3000,
@@ -861,9 +932,11 @@ if reset_clicked:
 if search_clicked:
     if dep_iata == arr_iata:
         st.session_state.search_error = "Departure and arrival airports must be different."
+        st.session_state.raw = None
 
     elif return_date <= outbound_date:
         st.session_state.search_error = "Return date must be after outbound date."
+        st.session_state.raw = None
 
     else:
         st.session_state.search_error = None
@@ -892,8 +965,8 @@ if st.session_state.search_error:
 if st.session_state.raw is None:
     if not st.session_state.search_error:
         st.info(
-            "Choose departure, arrival, dates, and currency in the sidebar. "
-            "Then click Search. The SerpAPI key is already loaded from Streamlit Secrets."
+            "Search airport by code, city, country, or airport name in the sidebar, then click Search. "
+            "The API key is loaded automatically from Streamlit Secrets."
         )
 
     st.stop()
@@ -1004,8 +1077,7 @@ st.markdown(
 st.markdown(
     '<div class="fhp-subtitle">'
     'Score blends price, guest rating, distance to the arrival airport, '
-    'and density of nearby attractions/restaurants. '
-    'You can adjust the weighting sliders in the sidebar.'
+    'and nearby attractions or restaurants. Adjust the sliders in the sidebar.'
     '</div>',
     unsafe_allow_html=True,
 )
@@ -1035,26 +1107,26 @@ hotel_display = (
 
 cards_html = []
 
-for _, h in df_hotels.iterrows():
-    is_top = h["rank"] == 1
+for _, hotel in df_hotels.iterrows():
+    is_top = hotel["rank"] == 1
 
     rank_bg = AMBER_SOFT if is_top else PANEL_ALT
     rank_color = AMBER if is_top else TEXT_MUTED
 
     bars = [
-        ("Price", h["price_score"]),
-        ("Rating", h["rating_score"]),
-        ("Airport", h["airport_score"]),
-        ("Nearby", h["poi_score"]),
+        ("Price", hotel["price_score"]),
+        ("Rating", hotel["rating_score"]),
+        ("Airport", hotel["airport_score"]),
+        ("Nearby", hotel["poi_score"]),
     ]
 
     bars_html = ""
 
-    for label, b in bars:
+    for label, score in bars:
         bars_html += f"""
         <div style="flex:1;min-width:70px;">
             <div class="fhp-bar-track">
-                <div class="fhp-bar-fill" style="width:{b}%;"></div>
+                <div class="fhp-bar-fill" style="width:{score}%;"></div>
             </div>
             <div style="font-size:10px;color:{TEXT_DIM};margin-top:3px;">
                 {label}
@@ -1062,28 +1134,28 @@ for _, h in df_hotels.iterrows():
         </div>
         """
 
-    rating_value = h["rating"] if pd.notna(h["rating"]) else 0
+    rating_value = hotel["rating"] if pd.notna(hotel["rating"]) else 0
     full_stars = max(0, min(5, round(rating_value)))
     stars = "★" * full_stars + "☆" * (5 - full_stars)
 
-    reviews_value = int(h["reviews"]) if pd.notna(h["reviews"]) else 0
+    reviews_value = int(hotel["reviews"]) if pd.notna(hotel["reviews"]) else 0
 
     cards_html.append(
         f"""
         <div class="fhp-card{' fhp-card-top1' if is_top else ''}">
             <div style="display:flex;gap:14px;flex-wrap:wrap;">
                 <div class="fhp-rank" style="background:{rank_bg};color:{rank_color};">
-                    {h['rank']}
+                    {hotel['rank']}
                 </div>
 
                 <div style="flex:1;min-width:220px;">
                     <div style="display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;">
                         <div style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:15px;">
-                            {h['name']}
+                            {hotel['name']}
                         </div>
 
                         <div style="font-family:'JetBrains Mono',monospace;font-size:15px;color:{AMBER};">
-                            {h['price']} {currency}
+                            {hotel['price']} {currency}
                             <span style="color:{TEXT_MUTED};font-size:11px;"> /night</span>
                         </div>
                     </div>
@@ -1092,16 +1164,16 @@ for _, h in df_hotels.iterrows():
                         <span class="fhp-tag" style="color:{AMBER};">
                             {stars}
                             <span style="color:{TEXT_MUTED};">
-                                &nbsp;{h['rating']} ({reviews_value})
+                                &nbsp;{hotel['rating']} ({reviews_value})
                             </span>
                         </span>
 
                         <span class="fhp-tag">
-                            ✈ {h['airport_dist_km']} km from airport
+                            Airport {hotel['airport_dist_km']} km
                         </span>
 
                         <span class="fhp-tag">
-                            📍 {h['poi_count']} spots nearby
+                            Nearby {hotel['poi_count']} spots
                         </span>
                     </div>
 
@@ -1111,7 +1183,7 @@ for _, h in df_hotels.iterrows():
                 </div>
 
                 <div class="fhp-score" style="align-self:center;color:{AMBER if is_top else TEXT};min-width:46px;text-align:right;">
-                    {h['composite']:.0f}
+                    {hotel['composite']:.0f}
                 </div>
             </div>
         </div>
@@ -1174,26 +1246,26 @@ folium.Marker(
     icon=folium.Icon(color="blue", icon="plane", prefix="fa"),
 ).add_to(m)
 
-for _, h in df_hotels.iterrows():
-    color = "orange" if h["rank"] == 1 else "cadetblue"
+for _, hotel in df_hotels.iterrows():
+    marker_color = "orange" if hotel["rank"] == 1 else "cadetblue"
 
     folium.Marker(
-        [h["lat"], h["lon"]],
+        [hotel["lat"], hotel["lon"]],
         tooltip=(
-            f"#{h['rank']} {h['name']} | "
-            f"{h['price']} {currency}, score {h['composite']:.0f}"
+            f"#{hotel['rank']} {hotel['name']} | "
+            f"{hotel['price']} {currency}, score {hotel['composite']:.0f}"
         ),
-        icon=folium.Icon(color=color, icon="bed", prefix="fa"),
+        icon=folium.Icon(color=marker_color, icon="bed", prefix="fa"),
     ).add_to(m)
 
 if not df_pois.empty:
     for _, poi in df_pois.dropna(subset=["lat", "lon"]).head(60).iterrows():
-        color = CYAN if poi["category"] == "attraction" else ROSE
+        poi_color = CYAN if poi["category"] == "attraction" else ROSE
 
         folium.CircleMarker(
             [poi["lat"], poi["lon"]],
             radius=4,
-            color=color,
+            color=poi_color,
             fill=True,
             fill_opacity=0.8,
             tooltip=f"{poi['name']} ({poi['category']})",
@@ -1241,7 +1313,7 @@ if df_pois.empty:
     st.caption(
         "No attractions or restaurants found from Overpass. "
         "This can happen if the public Overpass server is busy, blocked, "
-        "or there are no OSM results in the selected radius."
+        "or there are no OpenStreetMap results in the selected radius."
     )
 
 else:
@@ -1253,13 +1325,17 @@ else:
         ["All", "Attractions", "Restaurants"]
     )
 
-    for tab, cat in [
+    for tab, category_filter in [
         (tab_all, None),
         (tab_attr, "attraction"),
         (tab_food, "restaurant"),
     ]:
         with tab:
-            shown = df_pois if cat is None else df_pois[df_pois["category"] == cat]
+            shown = (
+                df_pois
+                if category_filter is None
+                else df_pois[df_pois["category"] == category_filter]
+            )
 
             if shown.empty:
                 st.caption("No records found for this category.")
@@ -1269,7 +1345,7 @@ else:
 
             for _, poi in shown.iterrows():
                 is_food = poi["category"] == "restaurant"
-                icon = "🍽" if is_food else "🏛"
+                icon = "Food" if is_food else "Place"
                 color = ROSE if is_food else CYAN
 
                 if is_food and pd.notna(poi["cuisine"]):
@@ -1283,7 +1359,9 @@ else:
                     f"""
                     <div style="background:{PANEL};border:1px solid {BORDER};border-radius:10px;padding:12px 14px;">
                         <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;">
-                            <span style="color:{color};">{icon}</span>
+                            <span style="color:{color};font-size:11px;font-family:'JetBrains Mono',monospace;">
+                                {icon}
+                            </span>
                             <span style="font-family:'Space Grotesk',sans-serif;font-weight:600;font-size:13px;">
                                 {poi['name']}
                             </span>
@@ -1300,6 +1378,7 @@ else:
                     card,
                     unsafe_allow_html=True,
                 )
+
                 cols[i % 3].markdown(
                     "<div style='height:8px;'></div>",
                     unsafe_allow_html=True,
