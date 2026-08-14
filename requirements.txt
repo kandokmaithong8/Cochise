@@ -1,5 +1,7 @@
-streamlit>=1.36
-requests>=2.31
-pandas>=2.0
-folium>=0.16
-airportsdata>=20240607
+streamlit
+requests
+pandas
+folium
+airportsdata
+pycountry
+streamlit-searchbox
