@@ -1,9 +1,0 @@
-[server]
-# Streamlit watches app.py and reruns the whole script (fresh top-to-bottom
-# pass) whenever it sees the file change on disk. Some dev/preview tools
-# touch or resave files in the background, which can fire this mid-search
-# and produce exactly the "shows a result, then blanks, then shows it again"
-# flicker. Turning this off means the app only reruns from real UI
-# interactions (clicking Search, dragging a slider, etc.).
-runOnSave = false
-fileWatcherType = "none"
