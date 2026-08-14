@@ -1,9 +1,30 @@
-[server]
-# Streamlit watches app.py and reruns the whole script (fresh top-to-bottom
-# pass) whenever it sees the file change on disk. Some dev/preview tools
-# touch or resave files in the background, which can fire this mid-search
-# and produce exactly the "shows a result, then blanks, then shows it again"
-# flicker. Turning this off means the app only reruns from real UI
-# interactions (clicking Search, dragging a slider, etc.).
-runOnSave = false
-fileWatcherType = "none"
+# Native Streamlit theming: light main page, dark blue sidebar.
+#
+# This matches the AMBER/CYAN/... tokens defined in app.py's CSS
+# block. Setting it here (rather than only via injected CSS) is
+# important because Streamlit passes this theme information to
+# custom components (like streamlit-searchbox, which renders the
+# airport search box inside a sandboxed iframe) so they can match
+# the surrounding app automatically - something raw CSS injected
+# via st.markdown cannot reach into.
+#
+# Place this file at: .streamlit/config.toml in your repo root
+# (same folder structure as .streamlit/secrets.toml).
+
+[theme]
+base = "light"
+primaryColor = "#46595F"
+backgroundColor = "#F5F2E9"
+secondaryBackgroundColor = "#ECE9DD"
+textColor = "#20241E"
+borderColor = "#D7D6C6"
+linkColor = "#46595F"
+font = "sans serif"
+
+[theme.sidebar]
+primaryColor = "#3E7C93"
+backgroundColor = "#0A0F0D"
+secondaryBackgroundColor = "#182B29"
+textColor = "#EFF6F1"
+borderColor = "#2A403D"
+linkColor = "#6FA89A"
